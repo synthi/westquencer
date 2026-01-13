@@ -1,11 +1,11 @@
 -- westquencer.lua
--- v0.50 (SINGLE BRAIN ARCHITECTURE)
+-- v0.58 (CHAOS UPDATE: K2 PAGES, PARAMS & INJECTION)
 
 engine.name = 'None'
 
 local Tables    = include('lib/Tables')
 local LogicOps  = include('lib/LogicOps')
-local Patchbay  = include('lib/Patchbay') -- Instancia Maestra
+local Patchbay  = include('lib/Patchbay')
 local Clock     = include('lib/Clock')
 local MidiIO    = include('lib/MidiIO')
 local Step      = include('lib/Step')
@@ -18,18 +18,17 @@ local ui_metro
 local FPS = 30
 
 function init()
-  print("Westquencer v0.50: System Start...")
+  print("Westquencer v0.58: System Start...")
 
   Tables.init()
   init_params()
   MidiIO.init()
+  State.init(Sequencer, Patchbay) -- INYECCIÓN CORRECTA AL STATE
   
-  -- INYECCIÓN DE DEPENDENCIAS (CEREBRO ÚNICO)
-  -- Pasamos la misma instancia de Patchbay a todos
+  -- INYECCIÓN AL RESTO
   Sequencer.init(Patchbay)
   ScreenUI.init(Sequencer, Patchbay)
-  GridUI.init(Sequencer, ScreenUI, Patchbay)
-  State.init() -- State usa Sequencer y Patchbay internamente, revisar si necesita inyección futura
+  GridUI.init(Sequencer, ScreenUI, Patchbay, State)
   
   Sequencer.on_step_change = function()
     ScreenUI.dirty = true
@@ -41,14 +40,13 @@ function init()
   ui_metro = metro.init()
   ui_metro.time = 1 / FPS
   ui_metro.event = function()
-    if GridUI.dirty then GridUI.redraw() end
-    if ScreenUI.dirty then 
+    if Sequencer.running or GridUI.dirty then GridUI.redraw() end
+    if Sequencer.running or ScreenUI.dirty then 
       redraw() 
       ScreenUI.dirty = false 
     end
   end
   ui_metro:start()
-  
   print("Westquencer: Ready.")
 end
 
@@ -60,6 +58,14 @@ end
 
 function init_params()
   params:add_separator("WESTQUENCER")
+  
+  -- GRUPO RANDOMIZER
+  params:add_group("RANDOMIZER", 4)
+  params:add_number("rnd_strength", "Strength", 0, 100, 50)
+  params:add_number("rnd_density", "Density", 0, 100, 100)
+  params:add_option("rnd_scope", "Scope", {"Values", "Patch", "Both"}, 1)
+  params:add_number("global_prob", "Global Prob", 0, 100, 100)
+
   for i, row in ipairs({"A", "B", "C", "D"}) do
     params:add_group("ROW "..row.." SETUP", 5)
     params:add_option("row_"..row.."_type", "Type", {"Pitch", "CC", "Velocity", "Clock Mod", "Raw"}, 1)
@@ -72,23 +78,44 @@ end
 
 function key(n, z)
   if n == 1 then return end 
+  
+  -- K2: TOGGLE PAGE (SCOPES <-> SETTINGS)
+  if n == 2 and z == 1 then
+     if ScreenUI.page == 1 then ScreenUI.page = 2 else ScreenUI.page = 1 end
+     ScreenUI.dirty = true
+     redraw()
+     return
+  end
+  
   ScreenUI.handle_key(n, z)
-  ScreenUI.dirty = true
   redraw() 
 end
 
 function enc(n, d)
-  -- 1. GRID VALUES
+  -- PAGE 2: GLOBAL SETTINGS
+  if ScreenUI.page == 2 then
+     if n == 2 then
+        -- Selector de Lista
+        ScreenUI.settings_sel = util.clamp(ScreenUI.settings_sel + d, 1, #ScreenUI.settings_list)
+     elseif n == 3 then
+        -- Modificar Valor
+        local param_id = ScreenUI.settings_list[ScreenUI.settings_sel].id
+        params:delta(param_id, d)
+     end
+     ScreenUI.dirty = true
+     redraw()
+     return
+  end
+
+  -- PAGE 1: PERFORMANCE
   if Sequencer.editor_focus.active then
     if n == 2 or n == 3 then
       Sequencer.modify_focused_value(d)
-      ScreenUI.dirty = true
       redraw()
       return
     end
   end
   
-  -- 2. CONTEXT MENUS
   if ScreenUI.context.active then
      local id = ScreenUI.context.id
      local gens = Sequencer.gens
@@ -98,31 +125,26 @@ function enc(n, d)
         if n==2 then clk.rate_index = util.clamp(clk.rate_index + d, 1, 31) end
         if n==3 then clk.swing = util.clamp(clk.swing + d, 0, 100) end
         if n==1 then clk.pw = util.clamp(clk.pw + d, 1, 99) end
-        
-     elseif id >= 100 then -- GATES
+     elseif id >= 100 then
         local step = Sequencer.steps[id-100]
         if step then
           if n==2 then step.gate_prob = util.clamp(step.gate_prob + d, 0, 100) end
           if n==3 then step.gate_len  = util.clamp(step.gate_len + d, 1, 100) end
         end
-        
      elseif id == LogicOps.BUTTONS.CHAOS then
         if n==2 or n==3 then gens.chaos.prob = util.clamp(gens.chaos.prob + d, 0, 100) end
-        
      elseif id == LogicOps.BUTTONS.COMPARATOR then
         if n==1 then gens.comp.thresh = util.clamp(gens.comp.thresh + d, 0, 127) end
         if n==2 then gens.comp.src_a = util.clamp(gens.comp.src_a + d, 1, 4) end
         if n==3 then gens.comp.src_b = util.clamp(gens.comp.src_b + d, 1, 4) end
-        
      elseif id == LogicOps.BUTTONS.RND_JUMP then
-        if n==1 then gens.jump.target = util.clamp(gens.jump.target + d, 1, 16) end
-        if n==2 then gens.jump.prob = util.clamp(gens.jump.prob + d, 0, 100) end
+        if n==2 then gens.jump.target = util.clamp(gens.jump.target + d, 0, 16) end
+        if n==3 then gens.jump.prob = util.clamp(gens.jump.prob + d, 0, 100) end
      end
-     
-     ScreenUI.dirty = true; redraw(); return
+     redraw(); return
   end
 
-  ScreenUI.handle_enc(n, d); ScreenUI.dirty = true; redraw()
+  ScreenUI.handle_enc(n, d); redraw()
 end
 
 function cleanup()
