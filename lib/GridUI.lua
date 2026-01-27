@@ -1,5 +1,5 @@
 -- lib/GridUI.lua
--- v0.58 (RND GESTURES & BRIGHTNESS)
+-- v0.59.2 (ANCHOR SELECTION & RND FIX)
 
 local GridUI = {}
 local LogicOps = include('lib/LogicOps')
@@ -20,25 +20,27 @@ GridUI.patching_dst = nil
 GridUI.tkb_fingers = {}
 GridUI.held_keys = {}
 
--- TABLA DE BRILLOS V0.58
+-- CONTADOR DE DEDOS (Para logica de Ancla)
+GridUI.fingers_down = 0
+
+-- TABLA DE BRILLOS
 local B_MUTE = 1
 local B_OFF  = 2
 local B_IN   = 5  
 local B_SRC  = 8  
 local B_HEAD = 9  
-local B_TRIG = 10 
+local B_TRIG = 12 
 local B_VERT = 14 
 local B_MAX  = 15 
 
 local VISUAL_HOLD_TIME = 0.08 
 
 function GridUI.init(seq, screen_ui, pb_ref, st_ref)
-  print("GridUI v0.58: Init...")
+  print("GridUI v0.59.2: Init...")
   EngineRef = seq
   ScreenRef = screen_ui
   PatchbayRef = pb_ref
   StateRef = st_ref
-  
   GridUI.device = grid.connect()
   if GridUI.device then GridUI.connected = true; GridUI.device.key = GridUI.key_event end
   for x=1, 16 do GridUI.cache[x] = {}; for y=1, 8 do GridUI.cache[x][y] = -1 end end
@@ -55,8 +57,12 @@ local function update_tkb_logic()
   elseif #fingers >= 2 then EngineRef.jam_active = false; EngineRef.set_loop_window(fingers[1], fingers[#fingers]) end
 end
 
+-- HELPER ID UNICO
+local function get_key_id(x, y) return (y * 16) + x end
+
 function GridUI.key_event(x, y, z)
   local now = util.time()
+  local kid = get_key_id(x, y)
   
   -- SHIFT
   if x==1 and y==1 then GridUI.shift_held=(z==1); GridUI.dirty=true; if z==0 then update_tkb_logic() end; return end
@@ -64,16 +70,14 @@ function GridUI.key_event(x, y, z)
   
   -- FILA 1
   if y == 1 then
-    -- RND GLOBAL (Botón 2 + SHIFT)
+    -- RND GLOBAL
     if x == LogicOps.BUTTONS.RND_GLOBAL and GridUI.shift_held and z == 1 then
        EngineRef.randomize_global()
        if ScreenRef then ScreenRef.trigger_message("GLOBAL RND") end
        GridUI.dirty = true; return
     end
-    
     if x==2 or x==8 or x==9 then return end
     
-    -- Normal Patchbay logic
     local is_in=false; for _,id in ipairs(LogicOps.INPUTS) do if x==id then is_in=true end end
     local is_out=false; for _,id in ipairs(LogicOps.OUTPUTS) do if x==id then is_out=true end end
     
@@ -106,20 +110,16 @@ function GridUI.key_event(x, y, z)
     GridUI.dirty = true; return
   end
   
-  -- FILAS 3-7 (RND ROW LOGIC)
+  -- FILAS 3-7 (RND + EDIT)
   if y >= 3 and y <= 7 then
+     -- A. RND LOGIC (SHIFT)
      if GridUI.shift_held then
         if z == 1 then
-           GridUI.held_keys[x] = now -- Empezar timer
-           -- Si pulsamos una columna > 1, es Single Random
-           if x > 1 then
-              EngineRef.randomize_step_values(x)
-              GridUI.dirty = true
-           end
+           GridUI.held_keys[kid] = now
+           if x > 1 then EngineRef.randomize_step_values(x); GridUI.dirty = true end
         else
-           -- Al soltar, check if Col 1 and Long Press
            if x == 1 then
-              local dur = now - (GridUI.held_keys[x] or 0)
+              local dur = now - (GridUI.held_keys[kid] or 0)
               if dur > 1.0 then
                  local rmap = {[3]="GATE", [4]="A", [5]="B", [6]="C", [7]="D"}
                  EngineRef.randomize_row(rmap[y])
@@ -129,30 +129,48 @@ function GridUI.key_event(x, y, z)
         end
         return
      end
-  end
-  
-  -- NORMAL ROW 3
-  if y == 3 then
-    if z == 1 then GridUI.held_keys[x] = now; GridUI.patching_src = LogicOps.STEP_GATE_BASE_ID + x; if ScreenRef then ScreenRef.open_context_menu(GridUI.patching_src, false, true) end
-    else
-      if (now - (GridUI.held_keys[x] or 0)) < 0.25 then local step = EngineRef.steps[x]; if step then step.gate_active = not step.gate_active end end
-      if GridUI.patching_src == (LogicOps.STEP_GATE_BASE_ID + x) then GridUI.patching_src = nil; if ScreenRef then ScreenRef.close_context_menu(); ScreenRef.clear_patching_view() end end
-    end
-    GridUI.dirty = true; return
-  end
-  
-  -- NORMAL ROW 4-7
-  if y >= 4 and y <= 7 then
-    local rmap = {[4]="A", [5]="B", [6]="C", [7]="D"}
-    if z == 1 then EngineRef.set_focus(x, rmap[y]) else if EngineRef.editor_focus.step_index==x and EngineRef.editor_focus.row_id==rmap[y] then EngineRef.clear_focus() end end
+     
+     -- B. MULTI-EDIT LOGIC (ANCHOR)
+     if y >= 4 and y <= 7 then
+        local rmap = {[4]="A", [5]="B", [6]="C", [7]="D"}
+        if z == 1 then
+           GridUI.fingers_down = GridUI.fingers_down + 1
+           -- Toggle logic: Si ya estaba, lo quita. Si no, lo pone.
+           if EngineRef.selection.steps[x] then
+              EngineRef.remove_selection(x)
+           else
+              EngineRef.add_selection(x, rmap[y])
+           end
+        else
+           GridUI.fingers_down = GridUI.fingers_down - 1
+           if GridUI.fingers_down < 0 then GridUI.fingers_down = 0 end
+           
+           -- Solo limpiar si soltamos el ultimo dedo
+           if GridUI.fingers_down == 0 then
+              EngineRef.clear_selection()
+           end
+        end
+        GridUI.dirty = true
+        return
+     end
+     
+     -- ROW 3 (GATE)
+     if y == 3 then
+        if z == 1 then GridUI.held_keys[kid] = now; GridUI.patching_src = LogicOps.STEP_GATE_BASE_ID + x; if ScreenRef then ScreenRef.open_context_menu(GridUI.patching_src, false, true) end
+        else
+           if (now - (GridUI.held_keys[kid] or 0)) < 0.25 then local step = EngineRef.steps[x]; if step then step.gate_active = not step.gate_active end end
+           if GridUI.patching_src == (LogicOps.STEP_GATE_BASE_ID + x) then GridUI.patching_src = nil; if ScreenRef then ScreenRef.close_context_menu(); ScreenRef.clear_patching_view() end end
+        end
+        GridUI.dirty = true; return
+     end
   end
   
   -- FILA 8 (SNAPSHOTS)
   if y == 8 then 
      if GridUI.shift_held then
-        if z == 1 then GridUI.held_keys[x] = now
+        if z == 1 then GridUI.held_keys[kid] = now
         else
-           local duration = now - (GridUI.held_keys[x] or 0)
+           local duration = now - (GridUI.held_keys[kid] or 0)
            if duration > 1.0 then 
               if StateRef then StateRef.clear_snapshot(x); if ScreenRef then ScreenRef.trigger_message("CLEAR SNAP "..x) end end
            else 
@@ -180,12 +198,9 @@ function GridUI.redraw()
     for y=1, 8 do
       local b = 0
       
-      -- FILA 1
       if y == 1 then
         if x==1 then b = GridUI.shift_held and B_MAX or B_OFF
-        elseif x==2 then 
-           -- RND BTN
-           b = GridUI.shift_held and B_MAX or B_MUTE
+        elseif x==2 then b = GridUI.shift_held and B_MAX or B_MUTE
         elseif x==8 or x==9 then b = 0
         else
           local is_out=false; for _,id in ipairs(LogicOps.OUTPUTS) do if x==id then is_out=true end end
@@ -197,7 +212,7 @@ function GridUI.redraw()
              elseif x==LogicOps.BUTTONS.CHAOS then is_trig = is_vis(visual.last_trig_chaos, now); muted = EngineRef.gens.chaos.muted
              elseif x==LogicOps.BUTTONS.COMPARATOR then is_trig = is_vis(visual.last_trig_comp, now); muted = EngineRef.gens.comp.muted
              elseif x==LogicOps.BUTTONS.KEY_PULSE then is_trig = is_vis(visual.last_trig_key, now) end 
-             if muted then b = B_MUTE else b = is_trig and B_MAX or B_SRC end 
+             if muted then b = B_MUTE else b = is_trig and B_TRIG or B_SRC end 
              if GridUI.patching_src == x then b=B_MAX end
              if GridUI.patching_dst and PatchbayRef.is_connected(x, GridUI.patching_dst) then b=B_MAX end
           elseif is_in then
@@ -208,10 +223,8 @@ function GridUI.redraw()
           end
         end
         
-      -- FILA 2
       elseif y == 2 then if x==cursor then b=B_HEAD else b=0 end
       
-      -- FILA 3
       elseif y == 3 then
          local s = EngineRef.steps[x]
          if s then
@@ -221,7 +234,6 @@ function GridUI.redraw()
             if GridUI.patching_dst and PatchbayRef.is_connected(LogicOps.STEP_GATE_BASE_ID + x, GridUI.patching_dst) then b=B_MAX end
          end
          
-      -- FILAS 4-7
       elseif y>=4 and y<=7 then
          local s=EngineRef.steps[x]
          if s then 
@@ -235,10 +247,10 @@ function GridUI.redraw()
                end
                b = math.max(b, cursor_bright)
             end
-            if EngineRef.editor_focus.active and EngineRef.editor_focus.step_index==x then b=B_MAX end 
+            -- SELECCION
+            if EngineRef.selection.active and EngineRef.selection.steps[x] then b=B_MAX end 
          end
       
-      -- FILA 8
       elseif y==8 then
          if GridUI.shift_held and StateRef then 
             if StateRef.session_data.snapshots[x] then b=10 else b=B_OFF end
