@@ -1,5 +1,5 @@
 -- lib/GridUI.lua
--- v0.59.2 (ANCHOR SELECTION & RND FIX)
+-- v0.62 (INVERSE PATCHING)
 
 local GridUI = {}
 local LogicOps = include('lib/LogicOps')
@@ -19,8 +19,6 @@ GridUI.patching_src = nil
 GridUI.patching_dst = nil
 GridUI.tkb_fingers = {}
 GridUI.held_keys = {}
-
--- CONTADOR DE DEDOS (Para logica de Ancla)
 GridUI.fingers_down = 0
 
 -- TABLA DE BRILLOS
@@ -36,7 +34,7 @@ local B_MAX  = 15
 local VISUAL_HOLD_TIME = 0.08 
 
 function GridUI.init(seq, screen_ui, pb_ref, st_ref)
-  print("GridUI v0.59.2: Init...")
+  print("GridUI v0.62: Init...")
   EngineRef = seq
   ScreenRef = screen_ui
   PatchbayRef = pb_ref
@@ -57,7 +55,6 @@ local function update_tkb_logic()
   elseif #fingers >= 2 then EngineRef.jam_active = false; EngineRef.set_loop_window(fingers[1], fingers[#fingers]) end
 end
 
--- HELPER ID UNICO
 local function get_key_id(x, y) return (y * 16) + x end
 
 function GridUI.key_event(x, y, z)
@@ -68,7 +65,7 @@ function GridUI.key_event(x, y, z)
   if x==1 and y==1 then GridUI.shift_held=(z==1); GridUI.dirty=true; if z==0 then update_tkb_logic() end; return end
   if not EngineRef or not PatchbayRef then return end
   
-  -- FILA 1
+  -- FILA 1 (PATCHBAY BIDIRECCIONAL)
   if y == 1 then
     -- RND GLOBAL
     if x == LogicOps.BUTTONS.RND_GLOBAL and GridUI.shift_held and z == 1 then
@@ -81,17 +78,23 @@ function GridUI.key_event(x, y, z)
     local is_in=false; for _,id in ipairs(LogicOps.INPUTS) do if x==id then is_in=true end end
     local is_out=false; for _,id in ipairs(LogicOps.OUTPUTS) do if x==id then is_out=true end end
     
-    if z == 1 then
+    if z == 1 then -- PRESS
+      -- 1. Si pulsamos INPUT (Destino)
       if is_in then
         GridUI.patching_dst = x
+        -- ¿Tenemos ya un Source cogido?
         if GridUI.patching_src then
            local s = PatchbayRef.toggle_connection(GridUI.patching_src, x)
            if ScreenRef then ScreenRef.set_patching_view(GridUI.patching_src, x, s) end
            GridUI.dirty = true; return 
         end
-        if ScreenRef then ScreenRef.open_context_menu(x, is_in, is_out) end
+        -- Si no, abrimos menú destino
+        if ScreenRef then ScreenRef.open_context_menu(x, true, false) end
+      
+      -- 2. Si pulsamos OUTPUT (Source)
       elseif is_out then
         if GridUI.shift_held then
+           -- Mutes
            local gens = EngineRef.gens
            if x==LogicOps.BUTTONS.CLOCK_A then EngineRef.clk_a.muted = not EngineRef.clk_a.muted
            elseif x==LogicOps.BUTTONS.CLOCK_B then EngineRef.clk_b.muted = not EngineRef.clk_b.muted 
@@ -99,20 +102,45 @@ function GridUI.key_event(x, y, z)
            elseif x==LogicOps.BUTTONS.COMPARATOR then gens.comp.muted = not gens.comp.muted
            end
         else 
-           GridUI.patching_src = x 
-           if ScreenRef then ScreenRef.open_context_menu(x, is_in, is_out) end
+           GridUI.patching_src = x
+           -- INVERSE PATCHING: ¿Tenemos ya un Destino cogido?
+           if GridUI.patching_dst then
+              local s = PatchbayRef.toggle_connection(x, GridUI.patching_dst)
+              if ScreenRef then ScreenRef.set_patching_view(x, GridUI.patching_dst, s) end
+              GridUI.dirty = true; return
+           end
+           
+           if ScreenRef then ScreenRef.open_context_menu(x, false, true) end
         end
       end
-    else
-      if is_out and GridUI.patching_src==x then GridUI.patching_src=nil; if ScreenRef then ScreenRef.close_context_menu(); ScreenRef.clear_patching_view() end end
-      if is_in then GridUI.patching_dst=nil; if not GridUI.patching_src and ScreenRef then ScreenRef.close_context_menu() end end
+      
+    else -- RELEASE
+      -- Limpiar Source
+      if is_out and GridUI.patching_src==x then 
+         GridUI.patching_src=nil
+         -- Solo cerrar UI si no estamos haciendo inverse patch
+         if not GridUI.patching_dst and ScreenRef then 
+            ScreenRef.close_context_menu() 
+            ScreenRef.clear_patching_view() 
+         end 
+      end
+      
+      -- Limpiar Destino
+      if is_in and GridUI.patching_dst==x then 
+         GridUI.patching_dst=nil
+         -- Solo cerrar UI si no estamos haciendo forward patch
+         if not GridUI.patching_src and ScreenRef then 
+            ScreenRef.close_context_menu()
+            ScreenRef.clear_patching_view()
+         end
+      end
     end
     GridUI.dirty = true; return
   end
   
   -- FILAS 3-7 (RND + EDIT)
   if y >= 3 and y <= 7 then
-     -- A. RND LOGIC (SHIFT)
+     -- RND LOGIC
      if GridUI.shift_held then
         if z == 1 then
            GridUI.held_keys[kid] = now
@@ -130,36 +158,32 @@ function GridUI.key_event(x, y, z)
         return
      end
      
-     -- B. MULTI-EDIT LOGIC (ANCHOR)
+     -- MULTI-EDIT
      if y >= 4 and y <= 7 then
         local rmap = {[4]="A", [5]="B", [6]="C", [7]="D"}
         if z == 1 then
            GridUI.fingers_down = GridUI.fingers_down + 1
-           -- Toggle logic: Si ya estaba, lo quita. Si no, lo pone.
-           if EngineRef.selection.steps[x] then
-              EngineRef.remove_selection(x)
-           else
-              EngineRef.add_selection(x, rmap[y])
-           end
+           if EngineRef.selection.steps[x] then EngineRef.remove_selection(x)
+           else EngineRef.add_selection(x, rmap[y]) end
         else
            GridUI.fingers_down = GridUI.fingers_down - 1
            if GridUI.fingers_down < 0 then GridUI.fingers_down = 0 end
-           
-           -- Solo limpiar si soltamos el ultimo dedo
-           if GridUI.fingers_down == 0 then
-              EngineRef.clear_selection()
-           end
+           if GridUI.fingers_down == 0 then EngineRef.clear_selection() end
         end
         GridUI.dirty = true
         return
      end
      
-     -- ROW 3 (GATE)
+     -- ROW 3
      if y == 3 then
         if z == 1 then GridUI.held_keys[kid] = now; GridUI.patching_src = LogicOps.STEP_GATE_BASE_ID + x; if ScreenRef then ScreenRef.open_context_menu(GridUI.patching_src, false, true) end
         else
            if (now - (GridUI.held_keys[kid] or 0)) < 0.25 then local step = EngineRef.steps[x]; if step then step.gate_active = not step.gate_active end end
-           if GridUI.patching_src == (LogicOps.STEP_GATE_BASE_ID + x) then GridUI.patching_src = nil; if ScreenRef then ScreenRef.close_context_menu(); ScreenRef.clear_patching_view() end end
+           if GridUI.patching_src == (LogicOps.STEP_GATE_BASE_ID + x) then 
+              GridUI.patching_src = nil
+              -- INVERSE CHECK PARA GATES
+              if not GridUI.patching_dst and ScreenRef then ScreenRef.close_context_menu(); ScreenRef.clear_patching_view() end 
+           end
         end
         GridUI.dirty = true; return
      end
@@ -247,7 +271,6 @@ function GridUI.redraw()
                end
                b = math.max(b, cursor_bright)
             end
-            -- SELECCION
             if EngineRef.selection.active and EngineRef.selection.steps[x] then b=B_MAX end 
          end
       

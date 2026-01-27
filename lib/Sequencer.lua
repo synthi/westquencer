@@ -1,7 +1,8 @@
 -- lib/Sequencer.lua
--- v0.60.4 (TRIGGER SPY)
+-- v0.62 (TKB QUANTIZATION)
 
 local Step = include('lib/Step')
+local MidiIO = include('lib/MidiIO')
 local LogicOps = include('lib/LogicOps')
 local Clock = include('lib/Clock')
 
@@ -14,6 +15,8 @@ Sequencer.steps = {}
 Sequencer.pos_h = 1; Sequencer.pos_v = 1; Sequencer.direction_h = 1; Sequencer.running = true 
 Sequencer.selection = { active = false, row_id = "A", steps = {} }
 Sequencer.loop_start = 1; Sequencer.loop_end = 16; Sequencer.jam_active = false; Sequencer.jam_step = nil
+Sequencer.pending_jam_step = nil -- Nuevo para quant
+
 Sequencer.clk_a = Clock.new(); Sequencer.clk_b = Clock.new()
 Sequencer.visual = { last_trig_a=0, last_trig_b=0, last_trig_chaos=0, last_trig_comp=0, last_trig_key=0, last_trig_vertical=0, step_prob_result=true }
 
@@ -36,10 +39,10 @@ function Sequencer.init(pb_ref, midi_ref)
   MidiIORef = midi_ref 
   for i=1, 16 do Sequencer.steps[i] = Step.new(i) end
   if PatchbayRef then PatchbayRef.connect(LogicOps.BUTTONS.CLOCK_A, LogicOps.BUTTONS.CLOCK_H) end
-  print("SEQ v0.60.4: Init.")
+  print("SEQ v0.62: Init.")
 end
 
--- Helpers (Sin cambios)
+-- Helpers (Resumidos)
 function Sequencer.add_selection(idx, row) Sequencer.selection.active=true; Sequencer.selection.row_id=row; Sequencer.selection.steps[idx]=true; if Sequencer.on_step_change then Sequencer.on_step_change() end end
 function Sequencer.remove_selection(idx) Sequencer.selection.steps[idx]=nil; if Sequencer.on_step_change then Sequencer.on_step_change() end end
 function Sequencer.clear_selection() Sequencer.selection.active=false; Sequencer.selection.steps={}; if Sequencer.on_step_change then Sequencer.on_step_change() end end
@@ -63,17 +66,30 @@ function Sequencer.clock_coroutine()
     local status, err = pcall(function()
       local step_dur_base = 60 / (clock.get_tempo() or 110) / 4
       
-      -- TKB JAM
+      -- TKB JAM LOGIC (QUANTIZED)
+      local quant_mode = params:get("tkb_quant") -- 1=Off, 2=On
+      
       if Sequencer.jam_active then
-         if Sequencer.jam_step then Sequencer.pos_h = Sequencer.jam_step end
+         if Sequencer.jam_step then 
+            if quant_mode == 1 then
+               -- Instant
+               Sequencer.pos_h = Sequencer.jam_step 
+            else
+               -- Queue
+               Sequencer.pending_jam_step = Sequencer.jam_step
+            end
+         end
+         
          if not trig_flags.jam_prev then 
             Sequencer.visual.last_trig_key = now; trig_flags.jam_prev = true 
-            if Sequencer.steps[Sequencer.pos_h] and MidiIORef then 
-               print("SEQ: JAM TRIGGER Step "..Sequencer.pos_h) -- DEBUG
+            if quant_mode == 1 and Sequencer.steps[Sequencer.pos_h] and MidiIORef then 
                MidiIORef.send_event(Sequencer.steps[Sequencer.pos_h], 1) 
             end
          end
-      else trig_flags.jam_prev = false end
+      else 
+         trig_flags.jam_prev = false 
+         Sequencer.pending_jam_step = nil
+      end
       push_edge(Sequencer.gens.key.history, Sequencer.gens.key, Sequencer.jam_active)
 
       Sequencer.clk_a:update(dt, step_dur_base); Sequencer.clk_b:update(dt, step_dur_base)
@@ -117,10 +133,7 @@ function Sequencer.clock_coroutine()
          Sequencer.pos_v = Sequencer.pos_v + 1; if Sequencer.pos_v > 4 then Sequencer.pos_v = 1 end
          if Sequencer.visual.step_prob_result then 
             if Sequencer.steps[Sequencer.pos_h] and Sequencer.steps[Sequencer.pos_h].gate_active then 
-               if MidiIORef then 
-                  print("SEQ: VERT TRIGGER Step "..Sequencer.pos_h) -- DEBUG
-                  MidiIORef.send_event(Sequencer.steps[Sequencer.pos_h], Sequencer.pos_v) 
-               end
+               if MidiIORef then MidiIORef.send_event(Sequencer.steps[Sequencer.pos_h], Sequencer.pos_v) end
             end 
          end
          Sequencer.visual.last_trig_vertical = now
@@ -129,7 +142,13 @@ function Sequencer.clock_coroutine()
       
       local clk_h_pulse = read_in(LogicOps.BUTTONS.CLOCK_H); local step_changed = false
       if clk_h_pulse and not Sequencer.clk_h_prev then
-        if Sequencer.jam_active and Sequencer.jam_step then Sequencer.pos_h = Sequencer.jam_step
+        
+        -- APPLY PENDING JAM (Quantized)
+        if Sequencer.pending_jam_step then
+           Sequencer.pos_h = Sequencer.pending_jam_step
+           -- Al ejecutar salto cuantizado, forzamos disparo
+           if Sequencer.steps[Sequencer.pos_h] and MidiIORef then MidiIORef.send_event(Sequencer.steps[Sequencer.pos_h], 1) end
+        
         elseif not is_held then
            local next_h = Sequencer.pos_h + Sequencer.direction_h
            if Sequencer.direction_h > 0 then if next_h > Sequencer.loop_end then next_h = Sequencer.loop_start end
@@ -140,23 +159,14 @@ function Sequencer.clock_coroutine()
         Sequencer.pos_v = 1 
         local curr_s = Sequencer.steps[Sequencer.pos_h]
         if curr_s then
-           -- LOGICA DISPARO
            if curr_s.gate_active then
               local gprob = params:get("global_prob") or 100
               local combined_prob = (curr_s.gate_prob / 100) * (gprob / 100) * 100
               Sequencer.visual.step_prob_result = (math.random(100) <= combined_prob)
-              
               if Sequencer.visual.step_prob_result then 
-                 if MidiIORef then 
-                    print("SEQ: BANG! Step " .. Sequencer.pos_h) -- DEBUG CRITICO
-                    MidiIORef.send_event(curr_s, 1) 
-                 else
-                    print("SEQ ERROR: MidiIO Ref is Missing!")
-                 end
+                 if MidiIORef then MidiIORef.send_event(curr_s, 1) end
               end
-           else
-              Sequencer.visual.step_prob_result = false
-           end
+           else Sequencer.visual.step_prob_result = false end
         end
         step_changed = true
       end

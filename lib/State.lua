@@ -1,8 +1,7 @@
 -- lib/State.lua
--- v0.58 (INJECTION FIX)
+-- v0.62 (SAVE GLOBAL PARAMS)
 
 local State = {}
--- Eliminados los includes locales que causaban duplicidad
 local SequencerRef = nil
 local PatchbayRef = nil
 
@@ -12,7 +11,6 @@ for i=1, 16 do State.session_data.snapshots[i] = nil end
 function State.init(seq_ref, pb_ref)
   SequencerRef = seq_ref
   PatchbayRef = pb_ref
-  
   params.action_write = function(filename, name, number) State.save_to_disk(number) end
   params.action_read = function(filename, silent, number) State.load_from_disk(number) end
 end
@@ -30,18 +28,24 @@ end
 
 function State.save_snapshot(slot)
   if not SequencerRef or not PatchbayRef then return end
-  
   local snap = {}
+  
+  -- 1. STEPS
   snap.steps = {}
   for i=1, 16 do
      snap.steps[i] = {
         vals = deep_copy_table(SequencerRef.steps[i].vals),
         gate_active = SequencerRef.steps[i].gate_active,
         gate_prob = SequencerRef.steps[i].gate_prob,
-        gate_len = SequencerRef.steps[i].gate_len
+        gate_len = SequencerRef.steps[i].gate_len,
+        gate_tie = SequencerRef.steps[i].gate_tie
      }
   end
+  
+  -- 2. CONNECTIONS
   snap.connections = deep_copy_table(PatchbayRef.connections)
+  
+  -- 3. GENS
   snap.gens = {
      clk_a = { rate=SequencerRef.clk_a.rate_index, swing=SequencerRef.clk_a.swing, pw=SequencerRef.clk_a.pw, muted=SequencerRef.clk_a.muted },
      clk_b = { rate=SequencerRef.clk_b.rate_index, swing=SequencerRef.clk_b.swing, pw=SequencerRef.clk_b.pw, muted=SequencerRef.clk_b.muted },
@@ -49,6 +53,17 @@ function State.save_snapshot(slot)
      comp  = { thresh=SequencerRef.gens.comp.thresh, src_a=SequencerRef.gens.comp.src_a, src_b=SequencerRef.gens.comp.src_b, muted=SequencerRef.gens.comp.muted },
      jump  = { target=SequencerRef.gens.jump.target, prob=SequencerRef.gens.jump.prob }
   }
+  
+  -- 4. PARAMS (NEW v0.62)
+  snap.params = {
+     root = params:get("root_note"),
+     scale = params:get("scale_mode"),
+     range = params:get("pitch_range"),
+     base = params:get("base_octave"),
+     prob = params:get("global_prob"),
+     tkb = params:get("tkb_quant")
+  }
+  
   State.session_data.snapshots[slot] = snap
   print("State: Saved Snapshot "..slot)
 end
@@ -62,6 +77,7 @@ function State.load_snapshot(slot)
      SequencerRef.steps[i].gate_active = snap.steps[i].gate_active
      SequencerRef.steps[i].gate_prob = snap.steps[i].gate_prob
      SequencerRef.steps[i].gate_len = snap.steps[i].gate_len
+     SequencerRef.steps[i].gate_tie = snap.steps[i].gate_tie
   end
   PatchbayRef.connections = deep_copy_table(snap.connections)
   local g = snap.gens
@@ -72,6 +88,18 @@ function State.load_snapshot(slot)
      SequencerRef.gens.comp.thresh = g.comp.thresh; SequencerRef.gens.comp.src_a = g.comp.src_a; SequencerRef.gens.comp.src_b = g.comp.src_b; SequencerRef.gens.comp.muted = g.comp.muted
      SequencerRef.gens.jump.target = g.jump.target; SequencerRef.gens.jump.prob = g.jump.prob
   end
+  
+  -- LOAD PARAMS
+  local p = snap.params
+  if p then
+     params:set("root_note", p.root)
+     params:set("scale_mode", p.scale)
+     params:set("pitch_range", p.range)
+     params:set("base_octave", p.base)
+     params:set("global_prob", p.prob)
+     params:set("tkb_quant", p.tkb)
+  end
+  
   print("State: Loaded Snapshot "..slot)
 end
 
