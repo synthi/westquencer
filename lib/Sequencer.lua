@@ -1,13 +1,12 @@
 -- lib/Sequencer.lua
--- v0.60.2 (MIDI REF INJECTION)
+-- v0.60.4 (TRIGGER SPY)
 
 local Step = include('lib/Step')
--- NO include MidiIO local
 local LogicOps = include('lib/LogicOps')
 local Clock = include('lib/Clock')
 
 local PatchbayRef = nil 
-local MidiIORef = nil -- Referencia inyectada
+local MidiIORef = nil 
 
 local Sequencer = {}
 
@@ -34,14 +33,13 @@ end
 
 function Sequencer.init(pb_ref, midi_ref)
   PatchbayRef = pb_ref 
-  MidiIORef = midi_ref -- GUARDAMOS REFERENCIA
-  
+  MidiIORef = midi_ref 
   for i=1, 16 do Sequencer.steps[i] = Step.new(i) end
   if PatchbayRef then PatchbayRef.connect(LogicOps.BUTTONS.CLOCK_A, LogicOps.BUTTONS.CLOCK_H) end
-  print("SEQ v0.60.2: Init (Midi Injected).")
+  print("SEQ v0.60.4: Init.")
 end
 
--- SELECTION & RANDOM
+-- Helpers (Sin cambios)
 function Sequencer.add_selection(idx, row) Sequencer.selection.active=true; Sequencer.selection.row_id=row; Sequencer.selection.steps[idx]=true; if Sequencer.on_step_change then Sequencer.on_step_change() end end
 function Sequencer.remove_selection(idx) Sequencer.selection.steps[idx]=nil; if Sequencer.on_step_change then Sequencer.on_step_change() end end
 function Sequencer.clear_selection() Sequencer.selection.active=false; Sequencer.selection.steps={}; if Sequencer.on_step_change then Sequencer.on_step_change() end end
@@ -56,17 +54,22 @@ local function get_row_val(step, src_idx) if not step then return 0 end; if src_
 local function push_edge(buffer, state_obj, current_val) local val=(current_val and not state_obj.prev_state) and 1 or 0; table.remove(buffer, 1); table.insert(buffer, val); state_obj.prev_state=current_val end
 
 function Sequencer.clock_coroutine()
-  local last_time = util.time(); local trig_flags = { reset_h=false, dir_h=false, jump=false, reset_v=false, clk_v_prev=false, jam_prev=false }
+  local last_time = util.time()
+  local trig_flags = { reset_h=false, dir_h=false, jump=false, reset_v=false, clk_v_prev=false, jam_prev=false }
+  
   while true do
     local now = util.time(); local dt = now - last_time; last_time = now; if dt < 0 or dt > 0.5 then dt = 0.005 end
-    pcall(function()
+    
+    local status, err = pcall(function()
       local step_dur_base = 60 / (clock.get_tempo() or 110) / 4
       
+      -- TKB JAM
       if Sequencer.jam_active then
          if Sequencer.jam_step then Sequencer.pos_h = Sequencer.jam_step end
          if not trig_flags.jam_prev then 
             Sequencer.visual.last_trig_key = now; trig_flags.jam_prev = true 
             if Sequencer.steps[Sequencer.pos_h] and MidiIORef then 
+               print("SEQ: JAM TRIGGER Step "..Sequencer.pos_h) -- DEBUG
                MidiIORef.send_event(Sequencer.steps[Sequencer.pos_h], 1) 
             end
          end
@@ -114,7 +117,10 @@ function Sequencer.clock_coroutine()
          Sequencer.pos_v = Sequencer.pos_v + 1; if Sequencer.pos_v > 4 then Sequencer.pos_v = 1 end
          if Sequencer.visual.step_prob_result then 
             if Sequencer.steps[Sequencer.pos_h] and Sequencer.steps[Sequencer.pos_h].gate_active then 
-               if MidiIORef then MidiIORef.send_event(Sequencer.steps[Sequencer.pos_h], Sequencer.pos_v) end
+               if MidiIORef then 
+                  print("SEQ: VERT TRIGGER Step "..Sequencer.pos_h) -- DEBUG
+                  MidiIORef.send_event(Sequencer.steps[Sequencer.pos_h], Sequencer.pos_v) 
+               end
             end 
          end
          Sequencer.visual.last_trig_vertical = now
@@ -134,12 +140,19 @@ function Sequencer.clock_coroutine()
         Sequencer.pos_v = 1 
         local curr_s = Sequencer.steps[Sequencer.pos_h]
         if curr_s then
+           -- LOGICA DISPARO
            if curr_s.gate_active then
               local gprob = params:get("global_prob") or 100
               local combined_prob = (curr_s.gate_prob / 100) * (gprob / 100) * 100
               Sequencer.visual.step_prob_result = (math.random(100) <= combined_prob)
+              
               if Sequencer.visual.step_prob_result then 
-                 if MidiIORef then MidiIORef.send_event(curr_s, 1) end
+                 if MidiIORef then 
+                    print("SEQ: BANG! Step " .. Sequencer.pos_h) -- DEBUG CRITICO
+                    MidiIORef.send_event(curr_s, 1) 
+                 else
+                    print("SEQ ERROR: MidiIO Ref is Missing!")
+                 end
               end
            else
               Sequencer.visual.step_prob_result = false
@@ -150,6 +163,8 @@ function Sequencer.clock_coroutine()
       Sequencer.clk_h_prev = clk_h_pulse
       if Sequencer.on_step_change and step_changed then Sequencer.on_step_change() end
     end)
+    
+    if not status then print("SEQ ERROR: " .. tostring(err)) end
     clock.sleep(0.005)
   end
 end
