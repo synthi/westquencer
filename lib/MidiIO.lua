@@ -1,5 +1,5 @@
 -- lib/MidiIO.lua
--- v0.61 (NATIVE NB IMPLEMENTATION: play_note)
+-- v0.61.1 (FIX: MUSICUTIL SNAP)
 
 local MidiIO = {}
 local musicutil = require 'musicutil'
@@ -7,7 +7,7 @@ local nb_ref = nil
 
 function MidiIO.init(nb_lib)
   nb_ref = nb_lib
-  print("MidiIO v0.61: Native Engine Ready.")
+  print("MidiIO v0.61.1: Fix Musicutil.")
 end
 
 local function get_scaled_val(val, row_char)
@@ -16,10 +16,26 @@ local function get_scaled_val(val, row_char)
   return util.linlin(0, 127, min, max, val)
 end
 
+-- HELPER DE ESCALAS CORREGIDO
 local function get_note(val)
-  local root = params:get("root_note") or 0
-  local scale_type = params:get("scale_mode") or 1
-  return musicutil.snap_note_to_scale(val, root, scale_type)
+  -- 1. Obtener Root (Params devuelve 1-12, musicutil necesita 0-11)
+  local root_param = params:get("root_note") or 1
+  local root = root_param - 1 
+  
+  -- 2. Obtener Nombre de Escala
+  local scale_idx = params:get("scale_mode") or 1
+  -- Proteccion por si musicutil no esta cargado o el indice falla
+  local scale_name = "Major"
+  if musicutil.SCALES[scale_idx] then 
+     scale_name = musicutil.SCALES[scale_idx].name 
+  end
+
+  -- 3. Generar la tabla de notas para todo el rango MIDI (128 notas)
+  -- generate_scale(root, scale_name, octaves)
+  local scale_pool = musicutil.generate_scale(root, scale_name, 11)
+  
+  -- 4. Ajustar el valor (0-127) a la nota mas cercana de la piscina
+  return musicutil.snap_note_to_array(val, scale_pool)
 end
 
 function MidiIO.send_event(step, pos_v)
@@ -27,20 +43,19 @@ function MidiIO.send_event(step, pos_v)
   
   local rows = {"A", "B", "C", "D"}
   
-  -- DURACION (Calculada para NB: Segundos)
+  -- DURACION
   local tempo = clock.get_tempo() or 110
-  local step_time = 60 / tempo / 4 -- 1/16th en segundos
-  -- 100% gate = 90% del tiempo del paso para dejar respirar, ajustable
+  local step_time = 60 / tempo / 4 
   local duration = (step.gate_len / 100) * 0.9 * step_time 
   if duration < 0.05 then duration = 0.05 end
   
-  -- LEGATO (Si TIE está activo, sumamos un paso extra de duración)
+  -- LEGATO
   if step.gate_tie then duration = duration + step_time end 
   
-  -- VELOCITY (Normalizada 0.0 - 1.0 para NB)
+  -- VELOCITY
   local vel = 100
   for _, r in ipairs(rows) do
-     if params:get("row_"..r.."_role") == 2 then -- Role 2 = Velocity
+     if params:get("row_"..r.."_role") == 2 then 
         vel = get_scaled_val(step.vals[r], r)
      end
   end
@@ -53,17 +68,12 @@ function MidiIO.send_event(step, pos_v)
   
   if player_abcd and player_abcd.play_note then
      local note = get_note(abcd_val)
-     -- Metodo Nativo: play_note(note, velocity, duration_sec)
      player_abcd:play_note(note, vel_norm, duration)
-  elseif player_abcd then
-     -- Debug si el player existe pero no tiene el método (raro en nb estándar)
-     print("MidiIO Error: Player '"..player_abcd.name.."' missing :play_note")
   end
   
   -- === INDIVIDUAL ROW VOICES ===
   for _, r in ipairs(rows) do
      local role = params:get("row_"..r.."_role")
-     -- Buscar player especifico para esta fila (voice_a, voice_b...)
      local player = params:lookup_param("voice_"..string.lower(r)):get_player()
      local val = step.vals[r]
      
@@ -81,7 +91,7 @@ function MidiIO.send_event(step, pos_v)
               player:cc(cc_num, cc_val)
            end
            
-        elseif role == 4 then -- ROLE: MOD (Timbre/Cutoff genérico de NB)
+        elseif role == 4 then -- ROLE: MOD
            if player.mod then
               local mod_val = get_scaled_val(val, r) / 127
               player:mod(mod_val)
